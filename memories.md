@@ -25,6 +25,14 @@
 - `schema.sql` — добавлен индекс idx_reviews_created(created_at DESC)
 - `tools/tasks.js` — parseJsonField заменён на импорт из utils.js
 
+### Тестирование (настроено в v0.3)
+- vitest v4.x в devDependencies, скрипты: `npm test`, `npm run test:watch`
+- `vitest.config.js` — include: `tests/**/*.test.js`
+- 67 тестов: db(10), utils(12), tasks(21), reviews(24)
+- Хелперы: `tests/helpers/mock-server.js`, `tests/helpers/parse-response.js`
+- Мок db.js: `vi.hoisted()` + `vi.mock()` + in-memory SQLite (паттерн зафиксирован в `.cursor/rules/testing-patterns.mdc`)
+- db.js тестируется на реальной БД с префиксом `__test_db_`
+
 ### Следующая версия: 0.4 (Файловые блокировки)
 - `tools/file_locks.js` — file_lock, file_unlock, file_locks_list
 

@@ -1,0 +1,62 @@
+---
+description: Конкретные паттерны тестирования MCP tool-хендлеров — мок БД, мок сервера, хелперы
+globs: "tests/**"
+alwaysApply: false
+---
+# Паттерны тестирования MCP-инструментов
+
+## Тестовые хелперы
+
+| Файл | Назначение |
+|------|-----------|
+| `tests/helpers/mock-server.js` | Мок MCP-сервера: перехватывает `registerTool`, вызывает хендлеры через `callTool(name, params)` |
+| `tests/helpers/parse-response.js` | Парсит JSON из MCP-ответа `{ content: [{ type: 'text', text }] }` |
+
+## Мок db.js для ESM (vi.hoisted + vi.mock)
+
+Единственный рабочий паттерн для ESM + vitest:
+
+```javascript
+const dbState = vi.hoisted(() => ({ db: null }));
+
+vi.mock('../../db.js', () => ({
+  getDb: () => dbState.db,
+  run: (sql, ...params) => dbState.db.prepare(sql).run(...params),
+  get: (sql, ...params) => dbState.db.prepare(sql).get(...params),
+  all: (sql, ...params) => dbState.db.prepare(sql).all(...params),
+  prepare: (sql) => dbState.db.prepare(sql),
+  transaction: (fn) => dbState.db.transaction(fn)(),
+  close: () => {},
+}));
+```
+
+- `vi.hoisted()` создаёт `dbState` **до** `vi.mock` — гарантирует доступность
+- В `beforeEach`: `dbState.db = new Database(':memory:')` + применить schema.sql
+- В `afterEach`: `dbState.db.close()` + `dbState.db = null`
+
+## Тестирование tool-хендлера
+
+```javascript
+import { createMockServer } from '../helpers/mock-server.js';
+import { parseResponse } from '../helpers/parse-response.js';
+import { register } from '../../tools/имя_модуля.js';
+
+const mockServer = createMockServer();
+register(mockServer);
+
+const res = await mockServer.callTool('tool_name', { param: value });
+const data = parseResponse(res);
+```
+
+Хендлер получает уже провалидированные параметры (zod-валидация — ответственность SDK).
+
+## Тестирование db.js напрямую
+
+`tests/db.test.js` — единственный файл БЕЗ мока db.js. Использует реальную БД.
+- Тестовые данные: префикс `__test_db_` для ключей в таблице config
+- `afterAll`: удалить тестовые данные → `close()`
+
+## Fixture-данные
+
+Вставляй через `dbState.db.prepare('INSERT INTO ...').run(...)` напрямую в SQL.
+Не используй tool-хендлеры для создания фикстур (кроме случаев, когда тестируешь интеграцию между инструментами).
