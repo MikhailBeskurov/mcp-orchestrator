@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp-orchestrator": {
+      "command": "node",
+      "args": ["index.js"]
+    }
+  }
+}

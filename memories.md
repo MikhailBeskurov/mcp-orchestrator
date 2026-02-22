@@ -1,6 +1,6 @@
 # Memories — MCP Orchestrator
 
-## Текущая версия: 0.3 (Код-ревью) — ЗАВЕРШЕНА
+## Текущая версия: 0.5 (Интеграция с Cursor) — ЗАВЕРШЕНА
 
 ### Реализовано (v0.1)
 - `package.json` — ESM, зависимости: `@modelcontextprotocol/sdk ^1.26.0`, `better-sqlite3 ^11.0.0`, `zod ^3.24.0`
@@ -28,13 +28,28 @@
 ### Тестирование (настроено в v0.3)
 - vitest v4.x в devDependencies, скрипты: `npm test`, `npm run test:watch`
 - `vitest.config.js` — include: `tests/**/*.test.js`
-- 67 тестов: db(10), utils(12), tasks(21), reviews(24)
+- 67 тестов (v0.3): db(10), utils(12), tasks(21), reviews(24)
 - Хелперы: `tests/helpers/mock-server.js`, `tests/helpers/parse-response.js`
 - Мок db.js: `vi.hoisted()` + `vi.mock()` + in-memory SQLite (паттерн зафиксирован в `.cursor/rules/testing-patterns.mdc`)
 - db.js тестируется на реальной БД с префиксом `__test_db_`
 
-### Следующая версия: 0.4 (Файловые блокировки)
+### Реализовано (v0.4)
 - `tools/file_locks.js` — file_lock, file_unlock, file_locks_list
+  - file_lock: атомарная блокировка через transaction() (защита от race condition), идемпотентность при повторной блокировке тем же агентом, обработка UNIQUE constraint
+  - file_unlock: снятие блокировки только владельцем (DELETE)
+  - file_locks_list: фильтры locked_by и task_id, динамический WHERE, ORDER BY locked_at DESC
+  - Константа LOCKED_BY (executor_1, executor_2, reviewer_impl, reviewer_arch)
+  - Нормализация file через trim(), проверка пустого пути после trim
+  - Валидация task_id (проверка существования в tasks)
+- `schema.sql` — добавлены индексы idx_file_locks_locked_by, idx_file_locks_task
+- 85 тестов: db(10), utils(12), tasks(21), reviews(24), file_locks(18)
+
+### Реализовано (v0.5)
+- `.cursor/mcp.json` — конфигурация подключения MCP-сервера к Cursor (command: node, args: index.js, stdio-транспорт)
+- Smoke-тест: 11/11 инструментов — полный цикл task→review→file_lock через MCP-протокол
+
+### Следующая версия: 0.6 (Память проекта)
+- `memory_store`, `memory_search`, `memory_delete`
 
 ### Архитектурные решения
 - Синглтон БД устанавливается ТОЛЬКО после успешной инициализации (при ошибке — close + rethrow)

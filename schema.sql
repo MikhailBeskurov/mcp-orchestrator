@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS file_locks (
     task_id INTEGER REFERENCES tasks(id),
     locked_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_file_locks_locked_by ON file_locks(locked_by);
+CREATE INDEX IF NOT EXISTS idx_file_locks_task ON file_locks(task_id);
 
 -- Межагентные сообщения
 CREATE TABLE IF NOT EXISTS messages (
