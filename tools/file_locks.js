@@ -2,7 +2,7 @@
 import { z } from 'zod';
 import { run, get, all, transaction } from '../db.js';
 
-const LOCKED_BY = ['executor_1', 'executor_2', 'reviewer_impl', 'reviewer_arch'];
+const LOCKED_BY = ['executor_1', 'executor_2', 'reviewer_impl', 'reviewer_arch', 'orchestrator'];
 
 export function register(server) {
   // --- file_lock ---

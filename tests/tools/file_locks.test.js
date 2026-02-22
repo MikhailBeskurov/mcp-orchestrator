@@ -140,6 +140,18 @@ describe('tools/file_locks', () => {
       expect(text).toContain('не найдена');
     });
 
+    it('file_lock с locked_by = orchestrator (п. 10.4)', async () => {
+      const res = await mockServer.callTool('file_lock', {
+        file: 'src/orchestrator.js',
+        locked_by: 'orchestrator',
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(data.file).toBe('src/orchestrator.js');
+      expect(data.locked_by).toBe('orchestrator');
+      expect(data).toHaveProperty('locked_at');
+    });
+
     it('нормализация файла — пробелы по краям trim()', async () => {
       const res = await mockServer.callTool('file_lock', {
         file: '  src/trimmed.js  ',
@@ -204,6 +216,21 @@ describe('tools/file_locks', () => {
       expect(res.isError).toBe(true);
       const text = res.content?.[0]?.text ?? '';
       expect(text).toContain('другим агентом');
+    });
+
+    it('file_unlock с locked_by = orchestrator (п. 10.4)', async () => {
+      await mockServer.callTool('file_lock', {
+        file: 'src/orchestrator-unlock.js',
+        locked_by: 'orchestrator',
+      });
+
+      const res = await mockServer.callTool('file_unlock', {
+        file: 'src/orchestrator-unlock.js',
+        locked_by: 'orchestrator',
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(data).toEqual({ file: 'src/orchestrator-unlock.js', unlocked: true });
     });
 
     it('после разблокировки файл действительно удалён из БД', async () => {

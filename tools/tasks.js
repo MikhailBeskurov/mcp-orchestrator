@@ -1,13 +1,14 @@
 // tools/tasks.js — MCP-инструменты управления задачами (v0.3)
 import { z } from 'zod';
-import { run, get, all } from '../db.js';
+import { run, get, all, transaction } from '../db.js';
 import { parseJsonField } from '../utils.js';
 
 // Константы enum для переиспользования
-const ASSIGNED_TO = ['executor_1', 'executor_2', 'reviewer_impl', 'reviewer_arch'];
+const ASSIGNED_TO = ['executor_1', 'executor_2', 'reviewer_impl', 'reviewer_arch', 'orchestrator'];
 const PRIORITY = ['low', 'normal', 'high', 'critical'];
 const STATUS_PENDING = ['pending', 'in_progress', 'done', 'failed'];
 const STATUS_UPDATE = ['in_progress', 'done', 'failed'];
+const STATUS_CREATE = ['pending', 'in_progress'];
 
 /**
  * Преобразует строку задачи из БД в объект с распарсенными files и depends_on.
@@ -34,12 +35,13 @@ export function register(server) {
         description: z.string().optional().describe('Описание задачи'),
         assigned_to: z.enum(ASSIGNED_TO).describe('Агент-исполнитель'),
         priority: z.enum(PRIORITY).default('normal').describe('Приоритет'),
+        status: z.enum(STATUS_CREATE).default('pending').optional().describe('Начальный статус задачи'),
         files: z.array(z.string()).optional().describe('Список файлов задачи'),
         depends_on: z.array(z.number().int().positive()).optional().describe('ID задач-зависимостей'),
         session_id: z.number().int().positive().optional().describe('ID сессии'),
       },
     },
-    async ({ title, description, assigned_to, priority, files, depends_on, session_id }) => {
+    async ({ title, description, assigned_to, priority, status, files, depends_on, session_id }) => {
       try {
         // 1. Проверка depends_on — все задачи должны существовать
         if (depends_on && depends_on.length > 0) {
@@ -66,27 +68,84 @@ export function register(server) {
           }
         }
 
-        // 3. INSERT
+        // 3. INSERT задачи + автоблокировка файлов (в транзакции)
         const filesStr = files !== undefined ? JSON.stringify(files) : null;
         const dependsOnStr = depends_on !== undefined ? JSON.stringify(depends_on) : null;
 
-        const result = run(
-          `INSERT INTO tasks (title, description, assigned_to, priority, files, depends_on, session_id)
-           VALUES (@title, @description, @assigned_to, @priority, @files, @depends_on, @session_id)`,
-          {
-            title,
-            description: description ?? null,
-            assigned_to,
-            priority: priority ?? 'normal',
-            files: filesStr,
-            depends_on: dependsOnStr,
-            session_id: session_id ?? null,
-          }
-        );
+        let id;
+        let lockedFiles = [];
 
-        const id = Number(result.lastInsertRowid);
+        const txResult = transaction(() => {
+          const result = run(
+            `INSERT INTO tasks (title, description, assigned_to, priority, status, files, depends_on, session_id)
+             VALUES (@title, @description, @assigned_to, @priority, @status, @files, @depends_on, @session_id)`,
+            {
+              title,
+              description: description ?? null,
+              assigned_to,
+              priority: priority ?? 'normal',
+              status: status ?? 'pending',
+              files: filesStr,
+              depends_on: dependsOnStr,
+              session_id: session_id ?? null,
+            }
+          );
+          id = Number(result.lastInsertRowid);
+
+          // Автоблокировка файлов при наличии
+          if (files && files.length > 0) {
+            const normalizedFiles = files
+              .map((f) => (typeof f === 'string' ? f.trim() : ''))
+              .filter(Boolean);
+
+            if (normalizedFiles.length > 0) {
+              const uniqueFiles = [...new Set(normalizedFiles)];
+              const placeholders = uniqueFiles.map(() => '?').join(',');
+              const existingLocks = all(
+                `SELECT file, locked_by FROM file_locks WHERE file IN (${placeholders})`,
+                ...uniqueFiles
+              );
+              const existingByFile = new Map(existingLocks.map((r) => [r.file, r]));
+
+              for (const normalizedFile of normalizedFiles) {
+                const existing = existingByFile.get(normalizedFile);
+                if (existing) {
+                  if (existing.locked_by !== assigned_to) {
+                    throw new Error(
+                      `Файл "${normalizedFile}" уже заблокирован агентом ${existing.locked_by}`
+                    );
+                  }
+                  lockedFiles.push(normalizedFile);
+                  continue;
+                }
+
+                run(
+                  `INSERT INTO file_locks (file, locked_by, task_id) VALUES (@file, @locked_by, @task_id)`,
+                  {
+                    file: normalizedFile,
+                    locked_by: assigned_to,
+                    task_id: id,
+                  }
+                );
+                lockedFiles.push(normalizedFile);
+                existingByFile.set(normalizedFile, { locked_by: assigned_to });
+              }
+            }
+          }
+          return { id, lockedFiles };
+        });
+
+        id = txResult.id;
+        lockedFiles = txResult.lockedFiles;
+
+        const row = get(
+          `SELECT id, session_id, title, description, assigned_to, priority, status, result, files, depends_on, created_at, updated_at FROM tasks WHERE id = ?`,
+          id
+        );
+        const task = parseTask(row);
+        const response = { ...task, locked_files: lockedFiles };
         return {
-          content: [{ type: 'text', text: JSON.stringify({ id, status: 'pending' }) }],
+          content: [{ type: 'text', text: JSON.stringify(response) }],
         };
       } catch (err) {
         console.error('[task_create]', err);
@@ -166,25 +225,33 @@ export function register(server) {
           };
         }
 
-        if (result !== undefined) {
-          run(
-            `UPDATE tasks SET status = @status, result = @result, updated_at = CURRENT_TIMESTAMP WHERE id = @id`,
-            { status, result, id }
-          );
-        } else {
-          run(
-            `UPDATE tasks SET status = @status, updated_at = CURRENT_TIMESTAMP WHERE id = @id`,
-            { status, id }
-          );
-        }
+        let unlockedFiles = 0;
+        transaction(() => {
+          if (result !== undefined) {
+            run(
+              `UPDATE tasks SET status = @status, result = @result, updated_at = CURRENT_TIMESTAMP WHERE id = @id`,
+              { status, result, id }
+            );
+          } else {
+            run(
+              `UPDATE tasks SET status = @status, updated_at = CURRENT_TIMESTAMP WHERE id = @id`,
+              { status, id }
+            );
+          }
+          if (status === 'done' || status === 'failed') {
+            const delResult = run('DELETE FROM file_locks WHERE task_id = ?', id);
+            unlockedFiles = delResult.changes ?? 0;
+          }
+        });
 
         const row = get(
           `SELECT id, session_id, title, description, assigned_to, priority, status, result, files, depends_on, created_at, updated_at FROM tasks WHERE id = ?`,
           id
         );
         const task = parseTask(row);
+        const response = { ...task, unlocked_files: unlockedFiles };
         return {
-          content: [{ type: 'text', text: JSON.stringify(task) }],
+          content: [{ type: 'text', text: JSON.stringify(response) }],
         };
       } catch (err) {
         console.error('[task_update]', err);

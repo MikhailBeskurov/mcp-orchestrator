@@ -164,6 +164,45 @@ describe('tools/reviews', () => {
       expect(row.suggestion).toBe('Исправить так');
     });
 
+    it('review_submit возвращает полный объект (п. 10.3)', async () => {
+      const taskId = createTask();
+      const res = await mockServer.callTool('review_submit', {
+        task_id: taskId,
+        reviewer: 'reviewer_impl',
+        file: 'a.js',
+        line_start: 1,
+        line_end: 2,
+        priority: 'high',
+        category: 'bug',
+        description: 'Замечание',
+        suggestion: 'Исправить',
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      const requiredFields = [
+        'id',
+        'task_id',
+        'reviewer',
+        'file',
+        'line_start',
+        'line_end',
+        'priority',
+        'category',
+        'description',
+        'suggestion',
+        'status',
+        'resolve_comment',
+        'created_at',
+      ];
+      for (const field of requiredFields) {
+        expect(data).toHaveProperty(field);
+      }
+      expect(data.task_id).toBe(taskId);
+      expect(data.reviewer).toBe('reviewer_impl');
+      expect(data.file).toBe('a.js');
+      expect(data.status).toBe('open');
+    });
+
     it('пустой file (пробелы) нормализуется в null', async () => {
       const taskId = createTask();
       const res = await mockServer.callTool('review_submit', {
@@ -411,6 +450,300 @@ describe('tools/reviews', () => {
       expect(res.isError).toBeUndefined();
       const data = parseResponse(res);
       expect(data.resolve_comment).toBeNull();
+    });
+  });
+
+  describe('review_submit_batch', () => {
+    it('основной сценарий — батч из 2 замечаний', async () => {
+      const taskId = createTask();
+      const res = await mockServer.callTool('review_submit_batch', {
+        reviews: [
+          { task_id: taskId, reviewer: 'reviewer_impl', description: 'Замечание 1' },
+          { task_id: taskId, reviewer: 'reviewer_arch', description: 'Замечание 2' },
+        ],
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(Array.isArray(data)).toBe(true);
+      expect(data.length).toBe(2);
+      expect(data[0].task_id).toBe(taskId);
+      expect(data[0].description).toBe('Замечание 1');
+      expect(data[1].description).toBe('Замечание 2');
+    });
+
+    it('ошибка: task_id не найден в элементе → isError, ничего не записано', async () => {
+      const res = await mockServer.callTool('review_submit_batch', {
+        reviews: [
+          {
+            task_id: 99999,
+            reviewer: 'reviewer_impl',
+            description: 'Текст',
+          },
+        ],
+      });
+      expect(res.isError).toBe(true);
+      const text = res.content?.[0]?.text ?? '';
+      expect(text).toContain('Элемент [0]');
+      expect(text).toContain('не найдена');
+
+      const count = dbState.db.prepare('SELECT COUNT(*) as c FROM reviews').get().c;
+      expect(count).toBe(0);
+    });
+
+    it('ошибка: line_end без file → isError с индексом элемента', async () => {
+      const taskId = createTask();
+      const res = await mockServer.callTool('review_submit_batch', {
+        reviews: [
+          {
+            task_id: taskId,
+            reviewer: 'reviewer_impl',
+            description: 'Текст',
+            line_end: 10,
+          },
+        ],
+      });
+      expect(res.isError).toBe(true);
+      const text = res.content?.[0]?.text ?? '';
+      expect(text).toContain('Элемент [0]');
+      expect(text).toContain('file');
+
+      const count = dbState.db.prepare('SELECT COUNT(*) as c FROM reviews').get().c;
+      expect(count).toBe(0);
+    });
+
+    it('ошибка: line_end < line_start → isError с индексом элемента', async () => {
+      const taskId = createTask();
+      const res = await mockServer.callTool('review_submit_batch', {
+        reviews: [
+          {
+            task_id: taskId,
+            reviewer: 'reviewer_impl',
+            description: 'Текст',
+            file: 'a.js',
+            line_start: 20,
+            line_end: 10,
+          },
+        ],
+      });
+      expect(res.isError).toBe(true);
+      const text = res.content?.[0]?.text ?? '';
+      expect(text).toContain('Элемент [0]');
+      expect(text).toContain('line_end');
+
+      const count = dbState.db.prepare('SELECT COUNT(*) as c FROM reviews').get().c;
+      expect(count).toBe(0);
+    });
+
+    it('атомарность: ошибка во 2-м элементе → 1-й тоже не записан', async () => {
+      const taskId = createTask();
+      const res = await mockServer.callTool('review_submit_batch', {
+        reviews: [
+          { task_id: taskId, reviewer: 'reviewer_impl', description: 'Валидное' },
+          { task_id: 99999, reviewer: 'reviewer_impl', description: 'Невалидная задача' },
+        ],
+      });
+      expect(res.isError).toBe(true);
+      const text = res.content?.[0]?.text ?? '';
+      expect(text).toContain('Элемент [1]');
+
+      const count = dbState.db.prepare('SELECT COUNT(*) as c FROM reviews').get().c;
+      expect(count).toBe(0);
+    });
+
+    it('все опциональные поля', async () => {
+      const taskId = createTask();
+      const res = await mockServer.callTool('review_submit_batch', {
+        reviews: [
+          {
+            task_id: taskId,
+            reviewer: 'reviewer_impl',
+            file: 'x.js',
+            line_start: 1,
+            line_end: 2,
+            priority: 'high',
+            category: 'bug',
+            description: 'Баг',
+            suggestion: 'Исправить так',
+          },
+        ],
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(data.length).toBe(1);
+
+      const row = dbState.db.prepare('SELECT * FROM reviews WHERE id = ?').get(data[0].id);
+      expect(row.file).toBe('x.js');
+      expect(row.line_start).toBe(1);
+      expect(row.line_end).toBe(2);
+      expect(row.priority).toBe('high');
+      expect(row.category).toBe('bug');
+      expect(row.suggestion).toBe('Исправить так');
+    });
+
+    it('возвращает полные объекты', async () => {
+      const taskId = createTask();
+      const res = await mockServer.callTool('review_submit_batch', {
+        reviews: [
+          {
+            task_id: taskId,
+            reviewer: 'reviewer_impl',
+            file: 'a.js',
+            line_start: 1,
+            line_end: 2,
+            priority: 'high',
+            category: 'bug',
+            description: 'Замечание',
+            suggestion: 'Исправить',
+          },
+        ],
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(data.length).toBe(1);
+
+      const requiredFields = [
+        'id',
+        'task_id',
+        'reviewer',
+        'file',
+        'line_start',
+        'line_end',
+        'priority',
+        'category',
+        'description',
+        'suggestion',
+        'status',
+        'resolve_comment',
+        'created_at',
+      ];
+      for (const field of requiredFields) {
+        expect(data[0]).toHaveProperty(field);
+      }
+      expect(data[0].task_id).toBe(taskId);
+      expect(data[0].reviewer).toBe('reviewer_impl');
+      expect(data[0].file).toBe('a.js');
+      expect(data[0].status).toBe('open');
+    });
+  });
+
+  describe('review_resolve_batch', () => {
+    it('основной сценарий — батч-закрытие 2 замечаний', async () => {
+      const taskId = createTask();
+      dbState.db
+        .prepare(
+          `INSERT INTO reviews (task_id, reviewer, description) VALUES (?, 'reviewer_impl', 'A'), (?, 'reviewer_impl', 'B')`
+        )
+        .run(taskId, taskId);
+      const ids = dbState.db
+        .prepare('SELECT id FROM reviews ORDER BY id')
+        .all()
+        .map((r) => r.id);
+
+      const res = await mockServer.callTool('review_resolve_batch', {
+        resolutions: [
+          { id: ids[0], status: 'fixed' },
+          { id: ids[1], status: 'wontfix' },
+        ],
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(Array.isArray(data)).toBe(true);
+      expect(data.length).toBe(2);
+      expect(data[0].status).toBe('fixed');
+      expect(data[1].status).toBe('wontfix');
+    });
+
+    it('ошибка: замечание не найдено → isError', async () => {
+      const res = await mockServer.callTool('review_resolve_batch', {
+        resolutions: [{ id: 99999, status: 'fixed' }],
+      });
+      expect(res.isError).toBe(true);
+      const text = res.content?.[0]?.text ?? '';
+      expect(text).toContain('Элемент [0]');
+      expect(text).toContain('не найдено');
+    });
+
+    it('ошибка: уже закрытое замечание → isError с индексом', async () => {
+      const taskId = createTask();
+      dbState.db
+        .prepare(
+          `INSERT INTO reviews (task_id, reviewer, description, status) VALUES (?, 'reviewer_impl', 'Замечание', 'fixed')`
+        )
+        .run(taskId);
+      const reviewId = dbState.db.prepare('SELECT last_insert_rowid() as id').get().id;
+
+      const res = await mockServer.callTool('review_resolve_batch', {
+        resolutions: [{ id: reviewId, status: 'wontfix' }],
+      });
+      expect(res.isError).toBe(true);
+      const text = res.content?.[0]?.text ?? '';
+      expect(text).toContain('Элемент [0]');
+      expect(text).toContain('уже закрыто');
+    });
+
+    it('атомарность: ошибка во 2-м → 1-й тоже не обновлён', async () => {
+      const taskId = createTask();
+      dbState.db
+        .prepare(
+          `INSERT INTO reviews (task_id, reviewer, description) VALUES (?, 'reviewer_impl', 'A'), (?, 'reviewer_impl', 'B')`
+        )
+        .run(taskId, taskId);
+      const ids = dbState.db
+        .prepare('SELECT id FROM reviews ORDER BY id')
+        .all()
+        .map((r) => r.id);
+
+      const res = await mockServer.callTool('review_resolve_batch', {
+        resolutions: [
+          { id: ids[0], status: 'fixed' },
+          { id: 99999, status: 'fixed' },
+        ],
+      });
+      expect(res.isError).toBe(true);
+
+      const row1 = dbState.db.prepare('SELECT status FROM reviews WHERE id = ?').get(ids[0]);
+      expect(row1.status).toBe('open');
+    });
+
+    it('с resolve_comment', async () => {
+      const taskId = createTask();
+      dbState.db
+        .prepare(
+          `INSERT INTO reviews (task_id, reviewer, description) VALUES (?, 'reviewer_impl', 'Замечание')`
+        )
+        .run(taskId);
+      const reviewId = dbState.db.prepare('SELECT last_insert_rowid() as id').get().id;
+
+      const res = await mockServer.callTool('review_resolve_batch', {
+        resolutions: [
+          {
+            id: reviewId,
+            status: 'wontfix',
+            resolve_comment: 'По согласованию',
+          },
+        ],
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(data[0].status).toBe('wontfix');
+      expect(data[0].resolve_comment).toBe('По согласованию');
+    });
+
+    it('без resolve_comment — resolve_comment остаётся null', async () => {
+      const taskId = createTask();
+      dbState.db
+        .prepare(
+          `INSERT INTO reviews (task_id, reviewer, description) VALUES (?, 'reviewer_impl', 'Замечание')`
+        )
+        .run(taskId);
+      const reviewId = dbState.db.prepare('SELECT last_insert_rowid() as id').get().id;
+
+      const res = await mockServer.callTool('review_resolve_batch', {
+        resolutions: [{ id: reviewId, status: 'fixed' }],
+      });
+      expect(res.isError).toBeUndefined();
+      const data = parseResponse(res);
+      expect(data[0].resolve_comment).toBeNull();
     });
   });
 });
