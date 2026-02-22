@@ -108,6 +108,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_reviews_task ON reviews(task_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
+CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_to_read ON messages(to_agent, read);
 CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id);
 CREATE INDEX IF NOT EXISTS idx_memory_category ON memory(category);

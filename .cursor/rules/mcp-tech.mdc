@@ -1,0 +1,42 @@
+---
+description: Технические конвенции MCP-сервера — SDK, SQLite, ESM, модули инструментов
+globs: "*.js,*.mjs,*.sql"
+alwaysApply: false
+---
+# MCP Orchestrator — Технические конвенции
+
+## MCP SDK
+
+- Импорты:
+  - `McpServer` из `@modelcontextprotocol/sdk/server/mcp.js`
+  - `StdioServerTransport` из `@modelcontextprotocol/sdk/server/stdio.js`
+- Регистрация инструмента: `server.registerTool(name, { description, inputSchema }, handler)`
+- `inputSchema` — объект с полями-значениями `z.string()`, `z.number()` и т.д. (zod)
+- Handler возвращает: `{ content: [{ type: 'text', text: JSON.stringify(result) }] }`
+- **ЗАПРЕЩЕНО `console.log()`** — ломает stdio JSON-RPC. Только `console.error()`.
+
+## Контракт tool-модуля (tools/*.js)
+
+- Экспортирует `register(server)` — вызывается автоматически из `index.js`
+- Импортирует хелперы БД из `../db.js`: `run`, `get`, `all`, `prepare`, `transaction`
+- Для hot-path запросов: `prepare(sql)` один раз на уровне модуля, переиспользовать Statement
+- При ошибках: `{ content: [{ type: 'text', text: msg }], isError: true }`
+
+## Паттерны SQL в tool-модулях
+
+- **Опциональные поля в UPDATE:** если параметр не передан — НЕ включать в SET (иначе затрёт существующее значение null-ом). Строить UPDATE динамически или через if/else ветвление.
+- **Динамический WHERE:** массив `conditions` + объект `params`. Всегда передавать `params` в `all(sql, params)` даже если пустой `{}`.
+- **JSON-поля из БД:** парсить через `parseJsonField()` (null-safe, обрабатывает ошибки парсинга).
+
+## better-sqlite3
+
+- **Синхронный** API — не нужны async/await для запросов
+- `prepare(sql).run/get/all(params)` — позиционные или именованные параметры
+- `transaction(fn)` — атомарные операции (несколько INSERT в одном вызове)
+- Pragma: WAL, synchronous=NORMAL, foreign_keys=ON, busy_timeout=5000
+
+## ESM на Windows
+
+- `pathToFileURL()` для динамических импортов (пути с обратными слэшами)
+- `createRequire(import.meta.url)` для импорта JSON
+- `fileURLToPath(import.meta.url)` + `dirname()` для аналога `__dirname`
