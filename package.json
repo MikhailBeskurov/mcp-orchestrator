@@ -1,0 +1,15 @@
+{
+  "name": "mcp-orchestrator",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP Orchestrator — сервер координации мульти-агентной работы для Cursor",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "better-sqlite3": "^11.0.0",
+    "zod": "^3.24.0"
+  }
+}
