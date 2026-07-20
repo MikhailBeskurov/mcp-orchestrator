@@ -9,6 +9,8 @@ const PRIORITY = ['low', 'normal', 'high', 'critical'];
 const STATUS_PENDING = ['pending', 'in_progress', 'done', 'failed'];
 const STATUS_UPDATE = ['in_progress', 'done', 'failed'];
 const STATUS_CREATE = ['pending', 'in_progress'];
+const ACTIVE_STATUSES = ['pending', 'in_progress'];
+const TERMINAL_STATUSES = ['done', 'failed'];
 
 /**
  * Преобразует строку задачи из БД в объект с распарсенными files и depends_on.
@@ -22,6 +24,42 @@ function parseTask(row) {
     files: parseJsonField(row.files),
     depends_on: parseJsonField(row.depends_on),
   };
+}
+
+/**
+ * Нормализует пути и удаляет пустые значения/дубликаты, сохраняя порядок.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function normalizeFiles(value) {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value
+        .map((file) => (typeof file === 'string' ? file.trim() : ''))
+        .filter(Boolean)
+    ),
+  ];
+}
+
+/**
+ * Нормализует JSON-поле files из строки БД.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function normalizeStoredFiles(value) {
+  const parsed = Array.isArray(value) ? value : parseJsonField(value);
+  return normalizeFiles(parsed);
+}
+
+/**
+ * Сравнивает nullable session_id.
+ * @param {unknown} left
+ * @param {unknown} right
+ * @returns {boolean}
+ */
+function isSameSession(left, right) {
+  return (left ?? null) === (right ?? null);
 }
 
 export function register(server) {
@@ -47,7 +85,7 @@ export function register(server) {
         if (depends_on && depends_on.length > 0) {
           const placeholders = depends_on.map(() => '?').join(',');
           const existing = all(`SELECT id FROM tasks WHERE id IN (${placeholders})`, ...depends_on);
-          const existingIds = new Set(existing.map((r) => r.id));
+          const existingIds = new Set(existing.map((row) => row.id));
           const missing = depends_on.filter((id) => !existingIds.has(id));
           if (missing.length > 0) {
             return {
@@ -69,11 +107,9 @@ export function register(server) {
         }
 
         // 3. INSERT задачи + автоблокировка файлов (в транзакции)
-        const filesStr = files !== undefined ? JSON.stringify(files) : null;
+        const normalizedFiles = normalizeFiles(files);
+        const filesStr = files !== undefined ? JSON.stringify(normalizedFiles) : null;
         const dependsOnStr = depends_on !== undefined ? JSON.stringify(depends_on) : null;
-
-        let id;
-        let lockedFiles = [];
 
         const txResult = transaction(() => {
           const result = run(
@@ -90,60 +126,91 @@ export function register(server) {
               session_id: session_id ?? null,
             }
           );
-          id = Number(result.lastInsertRowid);
+          const id = Number(result.lastInsertRowid);
+          const lockedFiles = [];
 
-          // Автоблокировка файлов при наличии
-          if (files && files.length > 0) {
-            const normalizedFiles = files
-              .map((f) => (typeof f === 'string' ? f.trim() : ''))
-              .filter(Boolean);
+          if (normalizedFiles.length > 0) {
+            const placeholders = normalizedFiles.map(() => '?').join(',');
+            const existingLocks = all(
+              `SELECT fl.file, fl.locked_by, fl.task_id,
+                      t.session_id AS task_session_id, t.status AS task_status
+               FROM file_locks fl
+               LEFT JOIN tasks t ON t.id = fl.task_id
+               WHERE fl.file IN (${placeholders})`,
+              ...normalizedFiles
+            );
+            const existingByFile = new Map(existingLocks.map((row) => [row.file, row]));
 
-            if (normalizedFiles.length > 0) {
-              const uniqueFiles = [...new Set(normalizedFiles)];
-              const placeholders = uniqueFiles.map(() => '?').join(',');
-              const existingLocks = all(
-                `SELECT file, locked_by FROM file_locks WHERE file IN (${placeholders})`,
-                ...uniqueFiles
-              );
-              const existingByFile = new Map(existingLocks.map((r) => [r.file, r]));
+            for (const normalizedFile of normalizedFiles) {
+              const existing = existingByFile.get(normalizedFile);
+              if (existing) {
+                if (existing.locked_by !== assigned_to) {
+                  throw new Error(
+                    `Файл "${normalizedFile}" уже заблокирован агентом ${existing.locked_by}`
+                  );
+                }
 
-              for (const normalizedFile of normalizedFiles) {
-                const existing = existingByFile.get(normalizedFile);
-                if (existing) {
-                  if (existing.locked_by !== assigned_to) {
-                    throw new Error(
-                      `Файл "${normalizedFile}" уже заблокирован агентом ${existing.locked_by}`
-                    );
-                  }
+                // Ручная блокировка того же агента остаётся ручной и не привязывается к задаче.
+                if (existing.task_id === null) {
                   lockedFiles.push(normalizedFile);
                   continue;
                 }
 
-                run(
-                  `INSERT INTO file_locks (file, locked_by, task_id) VALUES (@file, @locked_by, @task_id)`,
-                  {
-                    file: normalizedFile,
-                    locked_by: assigned_to,
+                // Подбираем зависшую блокировку завершённой/удалённой задачи.
+                if (!existing.task_status || TERMINAL_STATUSES.includes(existing.task_status)) {
+                  run('UPDATE file_locks SET task_id = ? WHERE file = ?', id, normalizedFile);
+                  existingByFile.set(normalizedFile, {
+                    ...existing,
                     task_id: id,
-                  }
-                );
+                    task_session_id: session_id ?? null,
+                    task_status: status ?? 'pending',
+                  });
+                  lockedFiles.push(normalizedFile);
+                  continue;
+                }
+
+                // Одна физическая блокировка не может безопасно представлять задачи разных сессий.
+                if (!isSameSession(existing.task_session_id, session_id)) {
+                  throw new Error(
+                    `Файл "${normalizedFile}" уже используется активной задачей ${existing.task_id} ` +
+                      `в другой сессии`
+                  );
+                }
+
+                // В одной сессии несколько задач того же агента могут разделять блокировку.
+                // task_update передаст владение следующей активной задаче перед завершением владельца.
                 lockedFiles.push(normalizedFile);
-                existingByFile.set(normalizedFile, { locked_by: assigned_to });
+                continue;
               }
+
+              run(
+                `INSERT INTO file_locks (file, locked_by, task_id) VALUES (@file, @locked_by, @task_id)`,
+                {
+                  file: normalizedFile,
+                  locked_by: assigned_to,
+                  task_id: id,
+                }
+              );
+              lockedFiles.push(normalizedFile);
+              existingByFile.set(normalizedFile, {
+                file: normalizedFile,
+                locked_by: assigned_to,
+                task_id: id,
+                task_session_id: session_id ?? null,
+                task_status: status ?? 'pending',
+              });
             }
           }
+
           return { id, lockedFiles };
         });
 
-        id = txResult.id;
-        lockedFiles = txResult.lockedFiles;
-
         const row = get(
           `SELECT id, session_id, title, description, assigned_to, priority, status, result, files, depends_on, created_at, updated_at FROM tasks WHERE id = ?`,
-          id
+          txResult.id
         );
         const task = parseTask(row);
-        const response = { ...task, locked_files: lockedFiles };
+        const response = { ...task, locked_files: txResult.lockedFiles };
         return {
           content: [{ type: 'text', text: JSON.stringify(response) }],
         };
@@ -217,7 +284,7 @@ export function register(server) {
     },
     async ({ id, status, result }) => {
       try {
-        const existing = get('SELECT id FROM tasks WHERE id = ?', id);
+        const existing = get('SELECT id, session_id FROM tasks WHERE id = ?', id);
         if (!existing) {
           return {
             content: [{ type: 'text', text: `Задача с ID ${id} не найдена` }],
@@ -226,6 +293,7 @@ export function register(server) {
         }
 
         let unlockedFiles = 0;
+        let transferredFiles = 0;
         transaction(() => {
           if (result !== undefined) {
             run(
@@ -238,9 +306,52 @@ export function register(server) {
               { status, id }
             );
           }
-          if (status === 'done' || status === 'failed') {
-            const delResult = run('DELETE FROM file_locks WHERE task_id = ?', id);
-            unlockedFiles = delResult.changes ?? 0;
+
+          if (TERMINAL_STATUSES.includes(status)) {
+            const ownedLocks = all(
+              'SELECT file, locked_by FROM file_locks WHERE task_id = ? ORDER BY file ASC',
+              id
+            );
+
+            if (ownedLocks.length > 0) {
+              const candidates = all(
+                `SELECT id, session_id, assigned_to, files
+                 FROM tasks
+                 WHERE id <> ? AND status IN ('pending', 'in_progress') AND files IS NOT NULL
+                 ORDER BY id ASC`,
+                id
+              ).map((candidate) => ({
+                ...candidate,
+                normalized_files: normalizeStoredFiles(candidate.files),
+              }));
+
+              for (const lock of ownedLocks) {
+                const replacement = candidates.find(
+                  (candidate) =>
+                    candidate.assigned_to === lock.locked_by &&
+                    isSameSession(candidate.session_id, existing.session_id) &&
+                    candidate.normalized_files.includes(lock.file)
+                );
+
+                if (replacement) {
+                  const transferResult = run(
+                    'UPDATE file_locks SET task_id = ? WHERE file = ? AND task_id = ?',
+                    replacement.id,
+                    lock.file,
+                    id
+                  );
+                  transferredFiles += transferResult.changes ?? 0;
+                  continue;
+                }
+
+                const deleteResult = run(
+                  'DELETE FROM file_locks WHERE file = ? AND task_id = ?',
+                  lock.file,
+                  id
+                );
+                unlockedFiles += deleteResult.changes ?? 0;
+              }
+            }
           }
         });
 
@@ -249,7 +360,11 @@ export function register(server) {
           id
         );
         const task = parseTask(row);
-        const response = { ...task, unlocked_files: unlockedFiles };
+        const response = {
+          ...task,
+          unlocked_files: unlockedFiles,
+          transferred_files: transferredFiles,
+        };
         return {
           content: [{ type: 'text', text: JSON.stringify(response) }],
         };
@@ -289,14 +404,14 @@ export function register(server) {
         const reviews = all('SELECT * FROM reviews WHERE task_id = ?', id);
         const messages = all('SELECT * FROM messages WHERE task_id = ?', id);
 
-        const result = {
+        const taskDetails = {
           ...task,
           reviews,
           messages,
         };
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result) }],
+          content: [{ type: 'text', text: JSON.stringify(taskDetails) }],
         };
       } catch (err) {
         console.error('[task_get]', err);
